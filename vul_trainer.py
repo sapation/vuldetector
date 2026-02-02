@@ -150,11 +150,16 @@ class VulTrainerManual:
             val_metrics = self.validate()
             
             print(f"\nEpoch {epoch+1}/{self.num_epochs}")
+            print(f"Train Precision: {train_metrics['precision']:.4f}")
             print(f"Train Loss: {train_loss:.4f}")
             print(f"Train F1: {train_metrics['f1']:.4f}")
+            print(f"Train Recall: {train_metrics['recall']:.4f}")
+            print(f"Train F1 per class: {train_metrics['class_f1']}")
+            print(f"Val Precision: {val_metrics['precision']:.4f}")
             print(f"Val Loss: {val_metrics['loss']:.4f}")
             print(f"Val F1: {val_metrics['f1']:.4f}")
-            print(f"Val Precision/Recall/F1 per class: {val_metrics['class_f1']}")
+            print(f"Val Recall: {val_metrics['recall']:.4f}")
+            print(f"Val F1 per class: {val_metrics['class_f1']}")
             
             # Early stopping based on F1 score
             if val_metrics['f1'] > self.best_f1:
