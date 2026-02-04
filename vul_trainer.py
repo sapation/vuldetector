@@ -5,7 +5,7 @@ from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
 from sklearn.metrics import precision_recall_fscore_support, accuracy_score
 
-from vul_detector import FocalLoss
+# from vul_detector import FocalLoss
 
 class VulTrainerManual:
     def __init__(self, model, train_loader, val_loader, device, 
@@ -21,7 +21,7 @@ class VulTrainerManual:
         
         # Setup weighted loss
         if class_weights is not None:
-            self.class_weights = torch.tensor(class_weights, dtype=torch.float)
+            self.class_weights = torch.tensor(class_weights, dtype=torch.float, device=device)
         else:
             self.class_weights = None
 
@@ -30,14 +30,13 @@ class VulTrainerManual:
             raise ValueError("loss_type must be 'cross_entropy' or 'focal'")
 
         if loss_type == "cross_entropy":
-            weight = self.class_weights.to(device) if self.class_weights is not None else None
-            self.criterion = torch.nn.CrossEntropyLoss(weight=weight)
+            self.criterion = torch.nn.CrossEntropyLoss()
         else:
-            self.criterion = FocalLoss(gamma=focal_gamma, weight=self.class_weights)
+            #self.criterion = FocalLoss(gamma=focal_gamma, weight=self.class_weights)
             self.criterion = self.criterion.to(device)
             
         # Optimizer and scheduler
-        self.optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
+        self.optimizer = AdamW(self.model.parameters(), lr=learning_rate, weight_decay=0.01)
         total_steps = len(train_loader) * num_epochs
         self.scheduler = get_linear_schedule_with_warmup(
             self.optimizer, 
@@ -46,7 +45,6 @@ class VulTrainerManual:
         )
         
         # For early stopping
-        self.best_f1 = 0
         self.patience = 5
         self.patience_counter = 0
         
@@ -73,7 +71,7 @@ class VulTrainerManual:
             'class_f1': f1.tolist()
         }
     
-    def train_epoch(self, epoch):
+    def train_epoch(self, epoch, threshold=0.5):
         self.model.train()
         total_loss = 0.0
         all_preds = []
@@ -82,9 +80,13 @@ class VulTrainerManual:
         progress_bar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{self.num_epochs}")
         
         for batch in progress_bar:
+            
             # Move batch to device
             batch = {k: v.to(self.device) for k, v in batch.items()}
             labels = batch.pop('labels')
+            if epoch == 1 and progress_bar.n == 0:
+                print("batch label counts:", torch.bincount(labels).cpu().tolist())
+                break
             
             self.optimizer.zero_grad()
             
@@ -102,13 +104,14 @@ class VulTrainerManual:
             
             # Track metrics
             total_loss += loss.item()
-            preds = torch.argmax(logits, dim=1)
+            probs = torch.softmax(logits, dim=1)[:, 1]
+            preds = (probs >= threshold).long()
+
             all_preds.extend(preds.detach().cpu().tolist())
             all_labels.extend(labels.detach().cpu().tolist())
             
             # Update progress bar
             progress_bar.set_postfix({"loss": loss.item()})
-            batch['labels'] = labels  # restore for safety if dataloader reuses dict
         
         # Calculate training metrics
         metrics = self.compute_metrics(np.array(all_preds), np.array(all_labels))
@@ -116,38 +119,57 @@ class VulTrainerManual:
         avg_loss = total_loss / len(self.train_loader)
         return avg_loss, metrics
     
-    def validate(self):
+    def validate(self, threshold=0.5):
         self.model.eval()
         total_loss = 0.0
+        all_probs = []
         all_preds = []
         all_labels = []
-        
+
         with torch.no_grad():
             for batch in self.val_loader:
                 batch = {k: v.to(self.device) for k, v in batch.items()}
-                labels = batch.pop('labels')
+                labels = batch.pop("labels")
+
                 outputs = self.model(**batch)
                 logits = outputs.logits
                 loss = self.criterion(logits, labels)
 
-                preds = torch.argmax(logits, dim=1)
+                probs = torch.softmax(logits, dim=1)[:, 1]
+                preds = (probs >= threshold).long()
+
+                all_probs.extend(probs.detach().cpu().tolist())
                 all_preds.extend(preds.detach().cpu().tolist())
                 all_labels.extend(labels.detach().cpu().tolist())
                 total_loss += loss.item()
 
         metrics = self.compute_metrics(np.array(all_preds), np.array(all_labels))
-        avg_loss = total_loss / max(len(self.val_loader), 1)
-        metrics['loss'] = avg_loss
+        metrics["loss"] = total_loss / max(len(self.val_loader), 1)
+        return metrics, np.array(all_probs), np.array(all_labels)
 
-        return metrics
-    
+    def find_best_threshold(probs, labels):
+        best_f1 = 0
+        best_t = 0.5
+        for t in np.linspace(0.05, 0.95, 19):
+            preds = (probs >= t).astype(int)
+            _, _, f1, _ = precision_recall_fscore_support(
+                labels, preds, average=None, zero_division=0
+            )
+            vuln_f1 = f1[1]
+            if vuln_f1 > best_f1:
+                best_f1 = vuln_f1
+                best_t = t
+        return best_t, best_f1
+
     def train(self):
         for epoch in range(self.num_epochs):
             # Training
             train_loss, train_metrics = self.train_epoch(epoch)
             
             # Validation
-            val_metrics = self.validate()
+            val_metrics, val_probs, val_labels = self.validate()
+            best_t, best_f1 = self.find_best_threshold(val_probs, val_labels)
+            print(f"Best threshold={best_t:.2f}, vuln F1={best_f1:.4f}")
             
             print(f"\nEpoch {epoch+1}/{self.num_epochs}")
             print(f"Train Precision: {train_metrics['precision']:.4f}")
@@ -162,8 +184,10 @@ class VulTrainerManual:
             print(f"Val F1 per class: {val_metrics['class_f1']}")
             
             # Early stopping based on F1 score
-            if val_metrics['f1'] > self.best_f1:
-                self.best_f1 = val_metrics['f1']
+            vuln_f1 = val_metrics["class_f1"][1]
+            print("Val vulnerable F1:", vuln_f1)
+            if vuln_f1 > best_f1:
+                self.best_f1 = vuln_f1
                 self.patience_counter = 0
                 # Save best model
                 torch.save(self.model.state_dict(), f"best_model_epoch_{epoch+1}.pt")

@@ -40,27 +40,34 @@ print("Example:", {k: train_dataset[0][k] for k in ["id", "project", "target", "
 model_name = "microsoft/unixcoder-base"
 tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
 
-MAX_LEN = 256  # start 256; try 384 if needed (1024 will likely OOM)
+MAX_LEN = 512  # start 256; try 384 if needed (1024 will likely OOM)
 
+# def tokenize_batch(batch):
+#     texts = [c.strip() for c in batch["func_clean"]]
+
+#     enc = tokenizer(
+#         texts,
+#         truncation=True,
+#         max_length=MAX_LEN,
+#         padding="max_length",
+#         add_special_tokens=True,
+#     )
+
+#     # Labels: prefer numeric target
+#     if "target" in batch:
+#         enc["labels"] = [int(x) for x in batch["target"]]
+#     else:
+#         enc["labels"] = [
+#             1 if a.strip().lower() == "vulnerable" else 0
+#             for a in batch["answer_text"]
+#         ]
+#     return enc
 def tokenize_batch(batch):
     texts = [c.strip() for c in batch["func_clean"]]
-
-    enc = tokenizer(
-        texts,
-        truncation=True,
-        max_length=MAX_LEN,
-        padding="max_length",
-        add_special_tokens=True,
-    )
+    enc = tokenizer(texts, truncation=True, max_length=MAX_LEN, padding="max_length")
 
     # Labels: prefer numeric target
-    if "target" in batch:
-        enc["labels"] = [int(x) for x in batch["target"]]
-    else:
-        enc["labels"] = [
-            1 if a.strip().lower() == "vulnerable" else 0
-            for a in batch["answer_text"]
-        ]
+    enc["labels"] = [int(x) for x in batch["target"]]
     return enc
 
 train_tok = train_dataset.map(
@@ -112,7 +119,7 @@ trainer = VulTrainerManual(
     class_weights=class_weights,
     learning_rate=2e-5,
     num_epochs=5,
-    loss_type="focal",
+    loss_type="cross_entropy",
     focal_gamma=2.0,
 )
 
@@ -121,23 +128,49 @@ trainer.train()
 # -------------------------
 # 5) Evaluate on validation/test splits
 # -------------------------
-def evaluate_loader(loader):
+def evaluate_loader(loader, model, device, criterion, threshold=0.5):
     model.eval()
     total_loss = 0.0
-    preds, labels = [], []
+    all_probs, all_preds, all_labels = [], [], []
+
     with torch.no_grad():
         for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
-            labels_batch = batch.pop("labels")
+            labels = batch.pop("labels")
+
             outputs = model(**batch)
             logits = outputs.logits
-            loss = trainer.criterion(logits, labels_batch)
+            loss = criterion(logits, labels)
             total_loss += loss.item()
-            preds.extend(torch.argmax(logits, dim=1).cpu().tolist())
-            labels.extend(labels_batch.cpu().tolist())
-    metrics = trainer.compute_metrics(np.array(preds), np.array(labels))
+    
+            probs = torch.softmax(logits, dim=1)[:, 1]        # P(vulnerable)
+            preds = (probs >= threshold).long()               # threshold decision
+
+            all_probs.extend(probs.cpu().tolist())
+            all_preds.extend(preds.cpu().tolist())
+            all_labels.extend(labels.cpu().tolist())
+
+    metrics = trainer.compute_metrics(np.array(all_preds), np.array(all_labels))
     metrics["loss"] = total_loss / max(len(loader), 1)
-    return metrics
+    return metrics, np.array(all_probs), np.array(all_labels)
+
+# def evaluate_loader(loader):
+#     model.eval()
+#     total_loss = 0.0
+#     preds, labels = [], []
+#     with torch.no_grad():
+#         for batch in loader:
+#             batch = {k: v.to(device) for k, v in batch.items()}
+#             labels_batch = batch.pop("labels")
+#             outputs = model(**batch)
+#             logits = outputs.logits
+#             loss = trainer.criterion(logits, labels_batch)
+#             total_loss += loss.item()
+#             preds.extend(torch.argmax(logits, dim=1).cpu().tolist())
+#             labels.extend(labels_batch.cpu().tolist())
+#     metrics = trainer.compute_metrics(np.array(preds), np.array(labels))
+#     metrics["loss"] = total_loss / max(len(loader), 1)
+#     return metrics
 
 best_ckpts = sorted(Path(".").glob("best_model_epoch_*.pt"), key=lambda p: p.stat().st_mtime)
 if best_ckpts:
@@ -148,10 +181,10 @@ if best_ckpts:
 else:
     print("No saved checkpoints found; evaluating current model state.")
 
-val_metrics = evaluate_loader(val_loader)
+val_metrics = evaluate_loader(val_loader, model, device, trainer.criterion)[0]
 print("Validation metrics:", val_metrics)
 
-test_metrics = evaluate_loader(test_loader)
+test_metrics = evaluate_loader(test_loader, model, device, trainer.criterion)[0]
 print("Test metrics:", test_metrics)
 
 
